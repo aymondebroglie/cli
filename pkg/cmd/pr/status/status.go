@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cli/cli/v2/api"
 	ghContext "github.com/cli/cli/v2/context"
@@ -21,6 +22,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const defaultInterval = 10 * time.Second
+
 type StatusOptions struct {
 	HttpClient func() (*http.Client, error)
 	GitClient  *git.Client
@@ -30,12 +33,16 @@ type StatusOptions struct {
 	Remotes    func() (ghContext.Remotes, error)
 	Branch     func() (string, error)
 
-	HasRepoOverride bool
-	Exporter        cmdutil.Exporter
-	ConflictStatus  bool
+	HasRepoOverride      bool
+	Exporter             cmdutil.Exporter
+	ConflictStatus       bool
+	Interval             time.Duration
+	Watch                bool
+	WithoutReviewRequest bool
 }
 
 func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Command {
+	var interval int
 	opts := &StatusOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
@@ -54,6 +61,17 @@ func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Co
 			opts.BaseRepo = f.BaseRepo
 			opts.HasRepoOverride = cmd.Flags().Changed("repo")
 
+			intervalChanged := cmd.Flags().Changed("interval")
+			if !opts.Watch && intervalChanged {
+				return cmdutil.FlagErrorf("cannot use --interval flag without `--watch` flag")
+			}
+			if intervalChanged {
+				var err error
+				opts.Interval, err = time.ParseDuration(fmt.Sprintf("%ds", interval))
+				if err != nil {
+					return cmdutil.FlagErrorf("could not parse `--interval` flag: %w", err)
+				}
+			}
 			if runF != nil {
 				return runF(opts)
 			}
@@ -62,6 +80,9 @@ func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Co
 	}
 
 	cmd.Flags().BoolVarP(&opts.ConflictStatus, "conflict-status", "c", false, "Display the merge conflict status of each pull request")
+	cmd.Flags().BoolVarP(&opts.Watch, "watch", "", false, "Watch status forever ")
+	cmd.Flags().IntVarP(&interval, "interval", "i", 10, "Refresh interval in seconds when using `--watch` flag")
+	cmd.Flags().BoolVarP(&opts.WithoutReviewRequest, "without-request", "", false, "Remove the review requested section")
 	cmdutil.AddJSONFlags(cmd, &opts.Exporter, api.PullRequestFields)
 
 	return cmd
@@ -110,60 +131,85 @@ func statusRun(opts *StatusOptions) error {
 		return err
 	}
 
-	err = opts.IO.StartPager()
-	if err != nil {
-		fmt.Fprintf(opts.IO.ErrOut, "error starting pager: %v\n", err)
-	}
-	defer opts.IO.StopPager()
-
-	if opts.Exporter != nil {
-		data := map[string]interface{}{
-			"currentBranch": nil,
-			"createdBy":     prPayload.ViewerCreated.PullRequests,
-			"needsReview":   prPayload.ReviewRequested.PullRequests,
+	if opts.Watch {
+		opts.IO.StartAlternateScreenBuffer()
+	} else {
+		err = opts.IO.StartPager()
+		if err != nil {
+			fmt.Fprintf(opts.IO.ErrOut, "error starting pager: %v\n", err)
 		}
-		if prPayload.CurrentPR != nil {
-			data["currentBranch"] = prPayload.CurrentPR
+		defer opts.IO.StopPager()
+	}
+
+	for {
+		cs := opts.IO.ColorScheme()
+		if opts.Watch {
+			opts.IO.RefreshScreen()
+			fmt.Fprintln(opts.IO.Out, cs.Boldf("Refreshing checks status every %v seconds. Press Ctrl+C to quit.\n", opts.Interval.Seconds()))
 		}
-		return opts.Exporter.Write(opts.IO, data)
-	}
 
-	out := opts.IO.Out
-	cs := opts.IO.ColorScheme()
+		if opts.Exporter != nil {
+			data := map[string]interface{}{
+				"currentBranch": nil,
+				"createdBy":     prPayload.ViewerCreated.PullRequests,
+				"needsReview":   prPayload.ReviewRequested.PullRequests,
+			}
+			if prPayload.CurrentPR != nil {
+				data["currentBranch"] = prPayload.CurrentPR
+			}
+			return opts.Exporter.Write(opts.IO, data)
+		}
 
-	fmt.Fprintln(out, "")
-	fmt.Fprintf(out, "Relevant pull requests in %s\n", ghrepo.FullName(baseRepo))
-	fmt.Fprintln(out, "")
+		out := opts.IO.Out
 
-	shared.PrintHeader(opts.IO, "Current branch")
-	currentPR := prPayload.CurrentPR
-	if currentPR != nil && currentPR.State != "OPEN" && prPayload.DefaultBranch == currentBranch {
-		currentPR = nil
-	}
-	if currentPR != nil {
-		printPrs(opts.IO, 1, *currentPR)
-	} else if currentPRHeadRef == "" {
-		shared.PrintMessage(opts.IO, "  There is no current branch")
-	} else {
-		shared.PrintMessage(opts.IO, fmt.Sprintf("  There is no pull request associated with %s", cs.Cyan("["+currentPRHeadRef+"]")))
-	}
-	fmt.Fprintln(out)
+		fmt.Fprintln(out, "")
+		fmt.Fprintf(out, "Relevant pull requests in %s\n", ghrepo.FullName(baseRepo))
+		fmt.Fprintln(out, "")
 
-	shared.PrintHeader(opts.IO, "Created by you")
-	if prPayload.ViewerCreated.TotalCount > 0 {
-		printPrs(opts.IO, prPayload.ViewerCreated.TotalCount, prPayload.ViewerCreated.PullRequests...)
-	} else {
-		shared.PrintMessage(opts.IO, "  You have no open pull requests")
-	}
-	fmt.Fprintln(out)
+		shared.PrintHeader(opts.IO, "Current branch")
+		currentPR := prPayload.CurrentPR
+		if currentPR != nil && currentPR.State != "OPEN" && prPayload.DefaultBranch == currentBranch {
+			currentPR = nil
+		}
+		if currentPR != nil {
+			printPrs(opts.IO, 1, *currentPR)
+		} else if currentPRHeadRef == "" {
+			shared.PrintMessage(opts.IO, "  There is no current branch")
+		} else {
+			shared.PrintMessage(opts.IO, fmt.Sprintf("  There is no pull request associated with %s", cs.Cyan("["+currentPRHeadRef+"]")))
+		}
+		fmt.Fprintln(out)
 
-	shared.PrintHeader(opts.IO, "Requesting a code review from you")
-	if prPayload.ReviewRequested.TotalCount > 0 {
-		printPrs(opts.IO, prPayload.ReviewRequested.TotalCount, prPayload.ReviewRequested.PullRequests...)
-	} else {
-		shared.PrintMessage(opts.IO, "  You have no pull requests to review")
+		shared.PrintHeader(opts.IO, "Created by you")
+		if prPayload.ViewerCreated.TotalCount > 0 {
+			printPrs(opts.IO, prPayload.ViewerCreated.TotalCount, prPayload.ViewerCreated.PullRequests...)
+		} else {
+			shared.PrintMessage(opts.IO, "  You have no open pull requests")
+		}
+		fmt.Fprintln(out)
+
+		if !opts.WithoutReviewRequest {
+			shared.PrintHeader(opts.IO, "Requesting a code review from you")
+			if prPayload.ReviewRequested.TotalCount > 0 {
+				printPrs(opts.IO, prPayload.ReviewRequested.TotalCount, prPayload.ReviewRequested.PullRequests...)
+			} else {
+				shared.PrintMessage(opts.IO, "  You have no pull requests to review")
+			}
+			fmt.Fprintln(out)
+		}
+
+		if !opts.Watch {
+			break
+		}
+		time.Sleep(opts.Interval)
+		prPayload, err = pullRequestStatus(httpClient, baseRepo, options)
+
+		if err != nil {
+			return err
+		}
+
 	}
-	fmt.Fprintln(out)
+	opts.IO.StopAlternateScreenBuffer()
 
 	return nil
 }
