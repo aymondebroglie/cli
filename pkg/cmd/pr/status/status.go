@@ -23,6 +23,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const defaultInterval = 10 * time.Second
+
 type StatusOptions struct {
 	HttpClient func() (*http.Client, error)
 	GitClient  *git.Client
@@ -36,7 +38,8 @@ type StatusOptions struct {
 	Exporter        cmdutil.Exporter
 	ConflictStatus  bool
 
-	Detector fd.Detector
+	Detector             fd.Detector
+	WithoutReviewRequest bool
 }
 
 func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Command {
@@ -75,6 +78,7 @@ func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Co
 
 	cmd.Flags().BoolVarP(&opts.ConflictStatus, "conflict-status", "c", false, "Display the merge conflict status of each pull request")
 	cmdutil.AddJSONFlags(cmd, &opts.Exporter, api.PullRequestFields)
+	cmd.Flags().BoolVarP(&opts.WithoutReviewRequest, "without-request", "", false, "Remove the review requested section")
 
 	return cmd
 }
@@ -207,13 +211,15 @@ func statusRun(opts *StatusOptions) error {
 	}
 	fmt.Fprintln(out)
 
-	shared.PrintHeader(opts.IO, "Requesting a code review from you")
-	if prPayload.ReviewRequested.TotalCount > 0 {
-		printPrs(opts.IO, prPayload.ReviewRequested.TotalCount, prPayload.ReviewRequested.PullRequests...)
-	} else {
-		shared.PrintMessage(opts.IO, "  You have no pull requests to review")
+	if !opts.WithoutReviewRequest {
+		shared.PrintHeader(opts.IO, "Requesting a code review from you")
+		if prPayload.ReviewRequested.TotalCount > 0 {
+			printPrs(opts.IO, prPayload.ReviewRequested.TotalCount, prPayload.ReviewRequested.PullRequests...)
+		} else {
+			shared.PrintMessage(opts.IO, "  You have no pull requests to review")
+		}
+		fmt.Fprintln(out)
 	}
-	fmt.Fprintln(out)
 
 	return nil
 }
